@@ -122,7 +122,14 @@ class BilibiliCrawler(AbstractCrawler):
                         "[BilibiliCrawler.start] 登录流程结束后仍未登录：请确认扫码已完成、"
                         "或 config.COOKIES 是否有效。已终止，否则视频会被静默限制在 480P。"
                     )
+                    if getattr(self, "watch_mode", False):
+                        raise RuntimeError("bilibili login required")
                     sys.exit(1)
+
+            if getattr(self, "watch_mode", False) and getattr(self, "watch_run", None):
+                await self.watch_run()
+                utils.logger.info("[BilibiliCrawler.start] watch pass finished")
+                return
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -570,6 +577,9 @@ class BilibiliCrawler(AbstractCrawler):
             return browser_context
 
         except Exception as e:
+            if getattr(self, "watch_mode", False):
+                utils.logger.error(f"[BilibiliCrawler] CDP mode launch failed, keeping the saved login profile: {e}")
+                raise
             utils.logger.error(f"[BilibiliCrawler] CDP mode launch failed, fallback to standard mode: {e}")
             # Fallback to standard mode
             chromium = playwright.chromium
@@ -577,13 +587,14 @@ class BilibiliCrawler(AbstractCrawler):
 
     async def close(self):
         """Close browser context"""
+        manager, context = getattr(self, "cdp_manager", None), getattr(self, "browser_context", None)
+        self.cdp_manager = None
+        self.browser_context = None
         try:
-            # If using CDP mode, special handling is required
-            if self.cdp_manager:
-                await self.cdp_manager.cleanup()
-                self.cdp_manager = None
-            elif self.browser_context:
-                await self.browser_context.close()
+            if manager:
+                await manager.cleanup()
+            elif context is not None:
+                await context.close()
             utils.logger.info("[BilibiliCrawler.close] Browser context closed ...")
         except TargetClosedError:
             utils.logger.warning("[BilibiliCrawler.close] Browser context was already closed.")

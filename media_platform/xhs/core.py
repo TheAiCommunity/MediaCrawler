@@ -101,7 +101,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            await self.context_page.goto(self.index_url, wait_until="domcontentloaded", timeout=60_000)
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
@@ -118,6 +118,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+            if getattr(self, "watch_mode", False) and not await self.xhs_client.pong():
+                raise RuntimeError("xiaohongshu login required")
+            if getattr(self, "watch_mode", False) and getattr(self, "watch_run", None):
+                await self.watch_run()
+                utils.logger.info("[XiaoHongShuCrawler.start] watch pass finished")
+                return
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -437,10 +443,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                channel="chrome",
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 
@@ -468,6 +475,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return browser_context
 
         except Exception as e:
+            if getattr(self, "watch_mode", False):
+                utils.logger.error(f"[XiaoHongShuCrawler] CDP mode launch failed, keeping the saved login profile: {e}")
+                raise
             utils.logger.error(f"[XiaoHongShuCrawler] CDP mode launch failed, falling back to standard mode: {e}")
             # Fall back to standard mode
             chromium = playwright.chromium
@@ -475,12 +485,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def close(self):
         """Close browser context"""
-        # Special handling if using CDP mode
-        if self.cdp_manager:
-            await self.cdp_manager.cleanup()
-            self.cdp_manager = None
-        else:
-            await self.browser_context.close()
+        manager, context = getattr(self, "cdp_manager", None), getattr(self, "browser_context", None)
+        self.cdp_manager = None
+        self.browser_context = None
+        if manager:
+            await manager.cleanup()
+        elif context is not None:
+            await context.close()
         utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
 
     async def download_media(self, note_detail: Dict) -> None:

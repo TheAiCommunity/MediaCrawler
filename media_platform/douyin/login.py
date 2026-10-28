@@ -108,18 +108,40 @@ class DouYinLogin(AbstractLogin):
 
         return False
 
+    async def _login_surface_visible(self) -> bool:
+        """True when the QR panel or the SMS second-verify panel is already on screen."""
+        selectors = (
+            "[id^='login-full-panel']",
+            "#login-panel-new",
+            "#uc-second-verify",
+        )
+        for selector in selectors:
+            try:
+                if await self.context_page.locator(selector).first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def popup_login_dialog(self):
         """If the login dialog box does not pop up automatically, we will manually click the login button"""
-        dialog_selector = "xpath=//div[@id='login-panel-new']"
-        try:
-            # check dialog box is auto popup and wait for 10 seconds
-            await self.context_page.wait_for_selector(dialog_selector, timeout=1000 * 10)
-        except Exception as e:
-            utils.logger.error(f"[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, error: {e}")
-            utils.logger.info("[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, we will manually click the login button")
-            login_button_ele = self.context_page.locator("xpath=//p[text() = '登录']")
-            await login_button_ele.click()
+        # Douyin now opens a full-screen panel, then an SMS check (#uc-second-verify).
+        # Those layers sit on top of the old "登录" button, so clicking it closes nothing and times out.
+        for _ in range(20):
+            if await self._login_surface_visible():
+                utils.logger.info("[DouYinLogin.popup_login_dialog] Login or SMS verification is already visible. Finish it in the Chrome window; this process will keep waiting.")
+                return
             await asyncio.sleep(0.5)
+        utils.logger.info("[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, we will manually click the login button")
+        login_button_ele = self.context_page.locator("xpath=//p[text() = '登录']").first
+        try:
+            await login_button_ele.click(timeout=5000)
+        except Exception as e:
+            if await self._login_surface_visible():
+                utils.logger.info(f"[DouYinLogin.popup_login_dialog] Click skipped because the verification panel is open: {e}")
+                return
+            raise
+        await asyncio.sleep(0.5)
 
     async def login_by_qrcode(self):
         utils.logger.info("[DouYinLogin.login_by_qrcode] Begin login douyin by qrcode...")
@@ -129,8 +151,8 @@ class DouYinLogin(AbstractLogin):
             selector=qrcode_img_selector
         )
         if not base64_qrcode_img:
-            utils.logger.info("[DouYinLogin.login_by_qrcode] login qrcode not found please confirm ...")
-            sys.exit()
+            utils.logger.info("[DouYinLogin.login_by_qrcode] QR image was not extracted; scan the code in the Chrome window")
+            return
 
         partial_show_qrcode = functools.partial(utils.show_qrcode, base64_qrcode_img)
         asyncio.get_running_loop().run_in_executor(executor=None, func=partial_show_qrcode)

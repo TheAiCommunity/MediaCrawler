@@ -98,7 +98,8 @@ class DouYinCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            # Douyin keeps connections open, so "load" often never fires.
+            await self.context_page.goto(self.index_url, wait_until="domcontentloaded", timeout=60_000)
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
             if not await self.dy_client.pong(browser_context=self.browser_context):
@@ -114,6 +115,12 @@ class DouYinCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+            if getattr(self, "watch_mode", False) and not await self.dy_client.pong(browser_context=self.browser_context):
+                raise RuntimeError("douyin login required")
+            if getattr(self, "watch_mode", False) and getattr(self, "watch_run", None):
+                await self.watch_run()
+                utils.logger.info("[DouYinCrawler.start] watch pass finished")
+                return
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
@@ -351,10 +358,11 @@ class DouYinCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                channel="chrome",
             )  # type: ignore
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 
@@ -387,6 +395,9 @@ class DouYinCrawler(AbstractCrawler):
             return browser_context
 
         except Exception as e:
+            if getattr(self, "watch_mode", False):
+                utils.logger.error(f"[DouYinCrawler] CDP模式启动失败，保留已登录的浏览器目录: {e}")
+                raise
             utils.logger.error(f"[DouYinCrawler] CDP模式启动失败，回退到标准模式: {e}")
             # Fall back to standard mode
             chromium = playwright.chromium
@@ -394,12 +405,13 @@ class DouYinCrawler(AbstractCrawler):
 
     async def close(self) -> None:
         """Close browser context"""
-        # If you use CDP mode, special processing is required
-        if self.cdp_manager:
-            await self.cdp_manager.cleanup()
-            self.cdp_manager = None
-        else:
-            await self.browser_context.close()
+        manager, context = getattr(self, "cdp_manager", None), getattr(self, "browser_context", None)
+        self.cdp_manager = None
+        self.browser_context = None
+        if manager:
+            await manager.cleanup()
+        elif context is not None:
+            await context.close()
         utils.logger.info("[DouYinCrawler.close] Browser context closed ...")
 
     async def download_media(self, aweme_item: Dict) -> None:
