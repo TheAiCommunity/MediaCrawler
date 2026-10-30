@@ -37,7 +37,7 @@ from media_downloader import MediaDownloader
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
-from tools.cdp_browser import CDPBrowserManager
+from tools.cdp_browser import CDPBrowserManager, browser_context_alive
 from var import crawler_type_var, source_keyword_var
 
 from . import media as douyin_media
@@ -74,9 +74,19 @@ class DouYinCrawler(AbstractCrawler):
             ip_proxy_info: IpInfoModel = await self.ip_proxy_pool.get_proxy()
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
 
-        async with async_playwright() as playwright:
+        playwright_cm = None
+        if getattr(self, "watch_mode", False):
+            if getattr(self, "_watch_playwright", None) is None:
+                self._watch_playwright = await async_playwright().start()
+            playwright = self._watch_playwright
+        else:
+            playwright_cm = async_playwright()
+            playwright = await playwright_cm.__aenter__()
+        try:
             # Select startup mode based on configuration
-            if config.ENABLE_CDP_MODE:
+            if getattr(self, "watch_mode", False) and browser_context_alive(getattr(self, "browser_context", None)):
+                utils.logger.info("[DouYinCrawler] 复用已打开的监听浏览器")
+            elif config.ENABLE_CDP_MODE:
                 utils.logger.info("[DouYinCrawler] 使用CDP模式启动浏览器")
                 self.browser_context = await self.launch_browser_with_cdp(
                     playwright,
@@ -97,7 +107,10 @@ class DouYinCrawler(AbstractCrawler):
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
-            self.context_page = await self.browser_context.new_page()
+            if getattr(self, "watch_mode", False) and self.browser_context.pages:
+                self.context_page = self.browser_context.pages[0]
+            else:
+                self.context_page = await self.browser_context.new_page()
             # Douyin keeps connections open, so "load" often never fires.
             await self.context_page.goto(self.index_url, wait_until="domcontentloaded", timeout=60_000)
 
@@ -133,6 +146,9 @@ class DouYinCrawler(AbstractCrawler):
                 await self.get_creators_and_videos()
 
             utils.logger.info("[DouYinCrawler.start] Douyin Crawler finished ...")
+        finally:
+            if playwright_cm is not None:
+                await playwright_cm.__aexit__(None, None, None)
 
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")

@@ -32,6 +32,99 @@ from tools.browser_launcher import BrowserLauncher
 from tools import utils
 
 
+# 监听进程按平台固定调试端口。下一轮连接这个端口上的窗口，不再为同一登录目录启动第二个浏览器。
+WATCH_DEBUG_PORTS = {"xhs": 9222, "dy": 9223, "bili": 9224}
+_PROFILE_LOCKS = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+
+
+def watch_user_data_dir() -> str:
+    return os.path.join(
+        os.getcwd(),
+        "browser_data",
+        f"cdp_{config.USER_DATA_DIR % config.PLATFORM}",
+    )
+
+
+def profile_owner_pid(user_data_dir: str) -> Optional[int]:
+    """Chrome 占用登录目录时，SingletonLock 指向 hostname-pid。"""
+    try:
+        target = os.readlink(os.path.join(user_data_dir, "SingletonLock"))
+    except OSError:
+        return None
+    pid_text = target.rsplit("-", 1)[-1]
+    if pid_text.isdigit():
+        return int(pid_text)
+    return None
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def process_command(pid: int) -> str:
+    cmdline = f"/proc/{pid}/cmdline"
+    try:
+        with open(cmdline, "rb") as handle:
+            return handle.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+    except OSError:
+        pass
+    try:
+        import subprocess
+
+        return subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="], text=True, timeout=3
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def debug_port_from_command(command: str) -> Optional[int]:
+    marker = "--remote-debugging-port="
+    index = command.find(marker)
+    if index < 0:
+        return None
+    digits = []
+    for char in command[index + len(marker) :]:
+        if not char.isdigit():
+            break
+        digits.append(char)
+    if not digits:
+        return None
+    return int("".join(digits))
+
+
+def clear_stale_profile_lock(user_data_dir: str) -> None:
+    """只清理已经退出的浏览器留下的锁。正在使用的登录目录不动。"""
+    owner = profile_owner_pid(user_data_dir)
+    if owner and pid_alive(owner):
+        return
+    for name in _PROFILE_LOCKS:
+        try:
+            os.unlink(os.path.join(user_data_dir, name))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            utils.logger.warning(f"[CDPBrowserManager] 无法清理过期的浏览器锁 {name}: {exc}")
+
+
+def browser_context_alive(browser_context) -> bool:
+    if browser_context is None:
+        return False
+    try:
+        browser = getattr(browser_context, "browser", None)
+        if browser is not None and hasattr(browser, "is_connected") and not browser.is_connected():
+            return False
+        return browser_context.pages is not None
+    except Exception:
+        return False
+
+
 class CDPBrowserManager:
     """
     CDP browser manager, responsible for launching and managing browsers connected via CDP
@@ -43,6 +136,8 @@ class CDPBrowserManager:
         self.browser_context: Optional[BrowserContext] = None
         self.debug_port: Optional[int] = None
         self._cleanup_registered = False
+        self._owns_process = False
+        self._connected = False
 
     def _register_cleanup_handlers(self):
         """
@@ -109,6 +204,11 @@ class CDPBrowserManager:
                 # Connect to an existing browser that already has remote debugging enabled
                 return await self._connect_existing_browser(playwright, playwright_proxy, user_agent)
 
+            if os.environ.get("WATCH_MODE") == "1":
+                return await self._launch_or_reuse_watch_browser(
+                    playwright, playwright_proxy, user_agent, headless
+                )
+
             # 1. Detect browser path
             browser_path = await self._get_browser_path()
 
@@ -134,7 +234,7 @@ class CDPBrowserManager:
 
         except Exception as e:
             utils.logger.error(f"[CDPBrowserManager] CDP browser launch failed: {e}")
-            await self.cleanup()
+            await self.cleanup(force=self._owns_process and not self._connected)
             raise
 
     async def _connect_existing_browser(
@@ -194,6 +294,63 @@ class CDPBrowserManager:
         utils.logger.info("[CDPBrowserManager] Successfully connected to existing browser")
         return browser_context
 
+    async def _launch_or_reuse_watch_browser(
+        self,
+        playwright: Playwright,
+        playwright_proxy: Optional[Dict] = None,
+        user_agent: Optional[str] = None,
+        headless: bool = False,
+    ) -> BrowserContext:
+        """监听模式：每个平台只保留一个 Chrome。目录已被占用时只连接，不再启动第二个。"""
+        platform = config.PLATFORM
+        preferred = WATCH_DEBUG_PORTS.get(platform)
+        if preferred is None:
+            raise RuntimeError(f"监听模式没有为平台 {platform} 分配固定调试端口")
+        user_data_dir = watch_user_data_dir()
+        os.makedirs(user_data_dir, exist_ok=True)
+        owner = profile_owner_pid(user_data_dir)
+        if owner and pid_alive(owner):
+            command = process_command(owner)
+            port = debug_port_from_command(command) or preferred
+            expected = os.path.realpath(user_data_dir)
+            if command and expected not in command and user_data_dir not in command:
+                raise RuntimeError(
+                    f"{platform} 的登录目录正被另一个浏览器占用（pid {owner}）。"
+                    "本轮不会再启动浏览器，避免打开一套新的空目录。"
+                )
+            if not await self._test_cdp_connection(port):
+                raise RuntimeError(
+                    f"{platform} 的登录浏览器已在运行（pid {owner}），但端口 {port} 没有调试接口。"
+                    "本轮不会再启动一个浏览器去占用同一登录目录。"
+                )
+            self.debug_port = port
+            self._owns_process = False
+            utils.logger.info(f"[CDPBrowserManager] 复用已打开的 {platform} 浏览器，端口 {port}")
+            await self._connect_via_cdp(playwright)
+            self._connected = True
+            browser_context = await self._create_browser_context(playwright_proxy, user_agent)
+            self.browser_context = browser_context
+            return browser_context
+
+        if await self._test_cdp_connection(preferred, quiet=True):
+            raise RuntimeError(
+                f"端口 {preferred} 已被其他程序占用，不能为 {platform} 再启动浏览器。"
+            )
+        clear_stale_profile_lock(user_data_dir)
+        self.debug_port = preferred
+        self._owns_process = True
+        browser_path = await self._get_browser_path()
+        await self._launch_browser(browser_path, headless)
+        self._register_cleanup_handlers()
+        await self._connect_via_cdp(playwright)
+        self._connected = True
+        browser_context = await self._create_browser_context(playwright_proxy, user_agent)
+        self.browser_context = browser_context
+        utils.logger.info(
+            f"[CDPBrowserManager] 已启动 {platform} 浏览器并保留到下一轮，端口 {preferred}"
+        )
+        return browser_context
+
     async def _get_browser_path(self) -> str:
         """
         Get browser path
@@ -224,7 +381,7 @@ class CDPBrowserManager:
 
         return browser_path
 
-    async def _test_cdp_connection(self, debug_port: int) -> bool:
+    async def _test_cdp_connection(self, debug_port: int, quiet: bool = False) -> bool:
         """
         Test if CDP connection is available
         """
@@ -234,17 +391,19 @@ class CDPBrowserManager:
                 s.settimeout(5)
                 result = s.connect_ex(("localhost", debug_port))
                 if result == 0:
-                    utils.logger.info(
-                        f"[CDPBrowserManager] CDP port {debug_port} is accessible"
-                    )
+                    if not quiet:
+                        utils.logger.info(
+                            f"[CDPBrowserManager] CDP port {debug_port} is accessible"
+                        )
                     return True
-                else:
+                if not quiet:
                     utils.logger.warning(
                         f"[CDPBrowserManager] CDP port {debug_port} is not accessible"
                     )
-                    return False
+                return False
         except Exception as e:
-            utils.logger.warning(f"[CDPBrowserManager] CDP connection test failed: {e}")
+            if not quiet:
+                utils.logger.warning(f"[CDPBrowserManager] CDP connection test failed: {e}")
             return False
 
     async def _launch_browser(self, browser_path: str, headless: bool):
@@ -441,6 +600,12 @@ class CDPBrowserManager:
         Args:
             force: Whether to force cleanup browser process (ignoring AUTO_CLOSE_BROWSER config)
         """
+        if os.environ.get("WATCH_MODE") == "1" and not force:
+            # 断开本次控制连接，保留 Chrome 进程和它的登录目录。
+            self.browser_context = None
+            self.browser = None
+            utils.logger.info("[CDPBrowserManager] 监听模式保留已打开的浏览器，下一轮直接连接")
+            return
         try:
             # Close browser context
             if self.browser_context:

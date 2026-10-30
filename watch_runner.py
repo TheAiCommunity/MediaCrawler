@@ -14,6 +14,8 @@ PLATFORMS = (
     ("bilibili", "bili"),
 )
 GAP_SECONDS = 8
+# 每个平台只保留一个爬虫和它打开的 Chrome。下一轮复用，避免再启动浏览器去抢登录目录。
+_crawlers: dict = {}
 
 
 def _clear_proxy_env() -> None:
@@ -66,6 +68,29 @@ async def _fetch(crawler, platform: str, target) -> list[dict]:
     return cards_from_xhs(payload, target.profile_url)
 
 
+def _driver_disconnected(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        mark in text
+        for mark in ("connection closed", "pipe closed", "target closed", "browser has been closed")
+    )
+
+
+async def _forget_watch_browser(crawler) -> None:
+    """丢掉已经断开的 Playwright 通道。Chrome 进程还在的话，下一轮只重新连接。"""
+    crawler.browser_context = None
+    crawler.context_page = None
+    crawler.cdp_manager = None
+    playwright = getattr(crawler, "_watch_playwright", None)
+    crawler._watch_playwright = None
+    if playwright is None:
+        return
+    try:
+        await playwright.stop()
+    except Exception as exc:
+        print(f"[watch] 关闭失效的浏览器控制通道: {exc}", file=sys.stderr)
+
+
 def _keep_process_alive() -> None:
     """登录失败在 MediaCrawler 里会调用 sys.exit()。监听进程只停当前平台。"""
     os.environ["WATCH_MODE"] = "1"
@@ -74,16 +99,6 @@ def _keep_process_alive() -> None:
         raise RuntimeError(f"login required ({code})")
 
     sys.exit = _exit
-
-
-async def _close_crawler(crawler) -> None:
-    close = getattr(crawler, "close", None)
-    if close is None:
-        return
-    try:
-        await close()
-    except Exception as exc:
-        print(f"[watch] 关闭浏览器失败: {exc}", file=sys.stderr)
 
 
 async def _pass_platform(pb2, metadata, rpcs, saas_platform: str, crawler_platform: str) -> None:
@@ -103,8 +118,11 @@ async def _pass_platform(pb2, metadata, rpcs, saas_platform: str, crawler_platfo
     config.ENABLE_GET_COMMENTS = False
     config.ENABLE_GET_SUB_COMMENTS = False
     config.ENABLE_GET_MEDIA = False
-    crawler = CrawlerFactory.create_crawler(crawler_platform)
-    crawler.watch_mode = True
+    crawler = _crawlers.get(crawler_platform)
+    if crawler is None:
+        crawler = CrawlerFactory.create_crawler(crawler_platform)
+        crawler.watch_mode = True
+        _crawlers[crawler_platform] = crawler
 
     async def watch_run():
         for target in pulled.targets:
@@ -149,6 +167,14 @@ async def _pass_platform(pb2, metadata, rpcs, saas_platform: str, crawler_platfo
     try:
         await crawler.start()
     except Exception as exc:
+        if _driver_disconnected(exc):
+            print(f"[watch] {saas_platform} 浏览器控制通道已断开，重新连接原窗口", file=sys.stderr)
+            await _forget_watch_browser(crawler)
+            try:
+                await crawler.start()
+                return
+            except Exception as retry_exc:
+                exc = retry_exc
         code = classify_failure(saas_platform, str(exc))
         if code is None and ("login required" in str(exc).lower() or "登录" in str(exc)):
             code = "login_required"
@@ -160,8 +186,6 @@ async def _pass_platform(pb2, metadata, rpcs, saas_platform: str, crawler_platfo
             metadata=metadata,
             timeout=30,
         )
-    finally:
-        await _close_crawler(crawler)
 
 
 async def main() -> None:

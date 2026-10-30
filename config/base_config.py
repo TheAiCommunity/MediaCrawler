@@ -80,6 +80,8 @@ BROWSER_LAUNCH_TIMEOUT = 60
 # 用户需要在 Chrome 中开启远程调试：chrome://inspect/#remote-debugging
 # 或者使用命令行参数启动 Chrome：--remote-debugging-port=9222
 # 这种方式反检测效果最好，因为直接使用用户真实浏览器的所有 Cookie、扩展和浏览历史
+# 监听进程不要打开这个开关。三个平台不能共用一个浏览器。
+# 监听进程会自己保留窗口：小红书 9222、抖音 9223、B 站 9224，下一轮连接原窗口。
 CDP_CONNECT_EXISTING = False
 
 # 程序结束时是否自动关闭浏览器

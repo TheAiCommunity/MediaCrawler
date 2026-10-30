@@ -46,7 +46,7 @@ from media_downloader import MediaDownloader, is_ffmpeg_available
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import bilibili as bilibili_store
 from tools import utils
-from tools.cdp_browser import CDPBrowserManager
+from tools.cdp_browser import CDPBrowserManager, browser_context_alive
 from var import crawler_type_var, source_keyword_var
 
 from . import media as bili_media
@@ -78,9 +78,19 @@ class BilibiliCrawler(AbstractCrawler):
             ip_proxy_info: IpInfoModel = await self.ip_proxy_pool.get_proxy()
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
 
-        async with async_playwright() as playwright:
+        playwright_cm = None
+        if getattr(self, "watch_mode", False):
+            if getattr(self, "_watch_playwright", None) is None:
+                self._watch_playwright = await async_playwright().start()
+            playwright = self._watch_playwright
+        else:
+            playwright_cm = async_playwright()
+            playwright = await playwright_cm.__aenter__()
+        try:
             # Choose launch mode based on configuration
-            if config.ENABLE_CDP_MODE:
+            if getattr(self, "watch_mode", False) and browser_context_alive(getattr(self, "browser_context", None)):
+                utils.logger.info("[BilibiliCrawler] Reusing the open watch browser")
+            elif config.ENABLE_CDP_MODE:
                 utils.logger.info("[BilibiliCrawler] Launching browser using CDP mode")
                 self.browser_context = await self.launch_browser_with_cdp(
                     playwright,
@@ -96,7 +106,10 @@ class BilibiliCrawler(AbstractCrawler):
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
-            self.context_page = await self.browser_context.new_page()
+            if getattr(self, "watch_mode", False) and self.browser_context.pages:
+                self.context_page = self.browser_context.pages[0]
+            else:
+                self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.index_url)
 
             # Create a client to interact with the xiaohongshu website.
@@ -152,6 +165,9 @@ class BilibiliCrawler(AbstractCrawler):
             else:
                 pass
             utils.logger.info("[BilibiliCrawler.start] Bilibili Crawler finished ...")
+        finally:
+            if playwright_cm is not None:
+                await playwright_cm.__aexit__(None, None, None)
 
     async def search(self):
         """
