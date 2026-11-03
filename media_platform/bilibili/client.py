@@ -214,6 +214,30 @@ class BilibiliClient(AbstractApiClient, ProxyRefreshMixin):
             params.update({"bvid": bvid})
         return await self.get(uri, params, enable_params_sign=False)
 
+    async def get_video_player(self, bvid: str, cid: int) -> Dict:
+        """播放器信息。字幕列表在 subtitle.subtitles，不下载视频。"""
+        if not bvid or not cid or cid <= 0:
+            raise ValueError("bvid and cid must exist")
+        return await self.get("/x/player/wbi/v2", {"bvid": bvid, "cid": cid}, enable_params_sign=True)
+
+    async def fetch_subtitle_json(self, subtitle_url: str) -> Dict:
+        """字幕文件是独立 JSON，没有 B 站接口那层 code。"""
+        url = (subtitle_url or "").strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url.startswith("https://") and not url.startswith("http://"):
+            raise DataFetchError("invalid subtitle url")
+        await self._refresh_proxy_if_expired()
+        async with make_async_client(proxy=self.proxy) as client:
+            response = await client.request("GET", url, timeout=self.timeout, headers=self.headers)
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            raise DataFetchError("subtitle json decode failed")
+        if not isinstance(data, dict):
+            return {}
+        return data
+
     async def get_video_play_url(self, aid: int, cid: int, fnval: int = DASH_FNVAL) -> Dict:
         """
         Bilibli web video play url api

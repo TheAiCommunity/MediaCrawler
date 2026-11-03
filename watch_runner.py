@@ -5,7 +5,17 @@ import os
 import sys
 
 import config
-from watch_cards import cards_from_bilibili, cards_from_douyin, cards_from_xhs, classify_failure, xhs_creator
+from watch_cards import (
+    body_from_bili_subtitle,
+    body_from_xhs_note,
+    cards_from_bilibili,
+    cards_from_douyin,
+    cards_from_xhs,
+    classify_failure,
+    needs_detail,
+    pick_bili_subtitle,
+    xhs_creator,
+)
 
 
 PLATFORMS = (
@@ -14,6 +24,7 @@ PLATFORMS = (
     ("bilibili", "bili"),
 )
 GAP_SECONDS = 8
+BODY_GAP_SECONDS = 2
 # 每个平台只保留一个爬虫和它打开的 Chrome。下一轮复用，避免再启动浏览器去抢登录目录。
 _crawlers: dict = {}
 
@@ -54,6 +65,14 @@ def _grpc():
     }
 
 
+def _pull(pb2, metadata, rpcs, platform: str):
+    return rpcs["PullTargets"](
+        pb2.PullTargetsRequest(platform=platform, limit=1, worker_id=f"mediacrawler-{platform}"),
+        metadata=metadata,
+        timeout=30,
+    )
+
+
 async def _fetch(crawler, platform: str, target) -> list[dict]:
     if platform == "bilibili":
         payload = await crawler.bili_client.get_creator_videos(str(target.external_id), 1, 30)
@@ -66,6 +85,52 @@ async def _fetch(crawler, platform: str, target) -> list[dict]:
         raise RuntimeError("xsec_token expired")
     payload = await crawler.xhs_client.get_notes_by_creator(user_id, "", page_size=20, xsec_token=token, xsec_source=source)
     return cards_from_xhs(payload, target.profile_url)
+
+
+async def _attach_bodies(crawler, platform: str, target, cards: list[dict]) -> None:
+    """抖音文案已在列表里。小红书和 B 站只给新内容补正文，失败的单条留空。"""
+    if platform == "douyin":
+        return
+    since = int(getattr(target, "since_unix", 0) or 0)
+    fetched = False
+    for card in cards:
+        if not needs_detail(int(card.get("published_at_unix") or 0), since):
+            continue
+        if fetched:
+            await asyncio.sleep(BODY_GAP_SECONDS)
+        fetched = True
+        try:
+            if platform == "xiaohongshu":
+                card["body"] = await _xhs_body(crawler, card)
+            elif platform == "bilibili":
+                card["body"] = await _bili_body(crawler, card)
+        except Exception as exc:
+            if classify_failure(platform, str(exc)):
+                raise
+            print(f"[watch] {platform} {card.get('content_external_id')} 正文失败: {exc}", file=sys.stderr)
+            card["body"] = ""
+
+
+async def _xhs_body(crawler, card: dict) -> str:
+    note = await crawler.xhs_client.get_note_by_id(
+        card["content_external_id"],
+        card.get("xsec_source") or "pc_feed",
+        card.get("xsec_token") or "",
+    )
+    return body_from_xhs_note(note)
+
+
+async def _bili_body(crawler, card: dict) -> str:
+    detail = await crawler.bili_client.get_video_info(bvid=card["content_external_id"])
+    cid = int(((detail or {}).get("View") or {}).get("cid") or 0)
+    if cid <= 0:
+        return ""
+    player = await crawler.bili_client.get_video_player(card["content_external_id"], cid)
+    subtitle_url = pick_bili_subtitle(((player or {}).get("subtitle") or {}).get("subtitles"))
+    if not subtitle_url:
+        return ""
+    payload = await crawler.bili_client.fetch_subtitle_json(subtitle_url)
+    return body_from_bili_subtitle(payload)
 
 
 def _driver_disconnected(exc: BaseException) -> bool:
@@ -101,14 +166,50 @@ def _keep_process_alive() -> None:
     sys.exit = _exit
 
 
+async def _report_target(pb2, metadata, rpcs, crawler, saas_platform: str, target) -> bool:
+    """上报一位创作者。返回 False 时停止当前平台，避免登录失效后继续打开页面。"""
+    try:
+        cards = await _fetch(crawler, saas_platform, target)
+        await _attach_bodies(crawler, saas_platform, target, cards)
+    except Exception as exc:
+        code = classify_failure(saas_platform, str(exc))
+        if code:
+            rpcs["ReportHealth"](
+                pb2.ReportHealthRequest(platform=saas_platform, creator_id=target.creator_id, code=code, message=str(exc)[:500]),
+                metadata=metadata,
+                timeout=30,
+            )
+            return code == "token_expired"
+        print(f"[watch] {saas_platform} {target.external_id} transient: {exc}", file=sys.stderr)
+        return True
+    items = [
+        pb2.ContentItem(
+            content_external_id=card["content_external_id"],
+            title=card["title"],
+            url=card["url"],
+            published_at_unix=int(card["published_at_unix"] or 0),
+            body=str(card.get("body") or ""),
+        )
+        for card in cards
+    ]
+    rpcs["ReportItems"](
+        pb2.ReportItemsRequest(
+            creator_id=target.creator_id,
+            platform=target.platform or saas_platform,
+            external_id=target.external_id,
+            worker_id=f"mediacrawler-{saas_platform}",
+            items=items,
+        ),
+        metadata=metadata,
+        timeout=60,
+    )
+    return True
+
+
 async def _pass_platform(pb2, metadata, rpcs, saas_platform: str, crawler_platform: str) -> None:
     from main import CrawlerFactory
 
-    pulled = rpcs["PullTargets"](
-        pb2.PullTargetsRequest(platform=saas_platform, limit=5, worker_id=f"mediacrawler-{saas_platform}"),
-        metadata=metadata,
-        timeout=30,
-    )
+    pulled = _pull(pb2, metadata, rpcs, saas_platform)
     if not pulled.targets:
         print(f"[watch] {saas_platform} 没有到期的创作者，不打开浏览器", file=sys.stderr)
         return
@@ -125,43 +226,14 @@ async def _pass_platform(pb2, metadata, rpcs, saas_platform: str, crawler_platfo
         _crawlers[crawler_platform] = crawler
 
     async def watch_run():
-        for target in pulled.targets:
-            try:
-                cards = await _fetch(crawler, saas_platform, target)
-            except Exception as exc:
-                code = classify_failure(saas_platform, str(exc))
-                if code:
-                    rpcs["ReportHealth"](
-                        pb2.ReportHealthRequest(platform=saas_platform, creator_id=target.creator_id, code=code, message=str(exc)[:500]),
-                        metadata=metadata,
-                        timeout=30,
-                    )
-                    if code != "token_expired":
-                        return
-                    continue
-                print(f"[watch] {saas_platform} {target.external_id} transient: {exc}", file=sys.stderr)
-                continue
-            items = [
-                pb2.ContentItem(
-                    content_external_id=card["content_external_id"],
-                    title=card["title"],
-                    url=card["url"],
-                    published_at_unix=int(card["published_at_unix"] or 0),
-                )
-                for card in cards
-            ]
-            rpcs["ReportItems"](
-                pb2.ReportItemsRequest(
-                    creator_id=target.creator_id,
-                    platform=target.platform or saas_platform,
-                    external_id=target.external_id,
-                    worker_id=f"mediacrawler-{saas_platform}",
-                    items=items,
-                ),
-                metadata=metadata,
-                timeout=30,
-            )
-            await asyncio.sleep(GAP_SECONDS)
+        batch = pulled
+        while batch.targets:
+            for target in batch.targets:
+                if not await _report_target(pb2, metadata, rpcs, crawler, saas_platform, target):
+                    return
+            batch = _pull(pb2, metadata, rpcs, saas_platform)
+            if batch.targets:
+                await asyncio.sleep(GAP_SECONDS)
 
     crawler.watch_run = watch_run
     try:

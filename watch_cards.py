@@ -30,10 +30,12 @@ def cards_from_douyin(payload: dict | None) -> list[dict[str, Any]]:
         aweme_id = str(aweme.get("aweme_id") or "").strip()
         if not aweme_id:
             continue
+        desc = str(aweme.get("desc") or "").strip()
         cards.append(
             {
                 "content_external_id": aweme_id,
-                "title": _title(aweme.get("desc") or aweme.get("title")),
+                "title": _title(desc or aweme.get("title")),
+                "body": desc[:32000],
                 "url": f"https://www.douyin.com/video/{aweme_id}",
                 "published_at_unix": _unix(aweme.get("create_time")),
             }
@@ -61,6 +63,8 @@ def cards_from_xhs(payload: dict | None, profile_url: str) -> list[dict[str, Any
                 "title": _title(title),
                 "url": url,
                 "published_at_unix": _unix(note.get("time")),
+                "xsec_token": note_token,
+                "xsec_source": note_source or "pc_feed",
             }
         )
     return cards
@@ -93,6 +97,53 @@ def classify_failure(platform: str, message: str) -> str | None:
 def _xhs_query(profile_url: str) -> tuple[str, str]:
     query = dict(parse_qsl(urlparse(profile_url).query, keep_blank_values=False))
     return query.get("xsec_token", ""), query.get("xsec_source", "")
+
+
+def needs_detail(published_at_unix: int, since_unix: int) -> bool:
+    """详情和字幕只补尚未建立基线的一页，以及基线之后的新内容。"""
+    if int(since_unix or 0) <= 0:
+        return True
+    return int(published_at_unix or 0) > int(since_unix)
+
+
+def body_from_xhs_note(note: dict | None) -> str:
+    return str((note or {}).get("desc") or "").strip()[:32000]
+
+
+_BILI_PREFERRED = ("zh-CN", "zh-Hans", "ai-zh")
+
+
+def pick_bili_subtitle(subtitles: list | None) -> str:
+    chosen = ""
+    chosen_rank = len(_BILI_PREFERRED) + 1
+    for item in subtitles or []:
+        if not isinstance(item, dict):
+            continue
+        lan = str(item.get("lan") or "")
+        url = str(item.get("subtitle_url") or "").strip()
+        if not url or not _chinese_subtitle(lan):
+            continue
+        rank = _BILI_PREFERRED.index(lan) if lan in _BILI_PREFERRED else len(_BILI_PREFERRED)
+        if chosen and rank >= chosen_rank:
+            continue
+        chosen = url
+        chosen_rank = rank
+    return chosen
+
+
+def body_from_bili_subtitle(payload: dict | None) -> str:
+    lines = []
+    for cue in (payload or {}).get("body") or []:
+        if not isinstance(cue, dict):
+            continue
+        text = str(cue.get("content") or "").strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)[:32000]
+
+
+def _chinese_subtitle(lan: str) -> bool:
+    return lan in _BILI_PREFERRED or lan.startswith("zh")
 
 
 def _title(value: Any) -> str:
